@@ -43,7 +43,7 @@ class Core {
 	 */
 	public function handle_manual_backup() {
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( __( 'Unauthorized', 'lean-backup' ) );
+			wp_die( __( 'Unauthorized', 'lean-backup' ), '', [ 'response' => 403 ] );
 		}
 
 		check_admin_referer( 'lean_backup_run_action', 'lean_backup_run_nonce' );
@@ -121,13 +121,26 @@ class Core {
 	 */
 	public function sanitize_s3_settings( $input ) {
 		$sanitized = [];
+
 		foreach ( $input as $key => $val ) {
-			$sanitized[ $key ] = sanitize_text_field( $val );
+			// Secret/access keys may contain +, /, = — sanitize_text_field() is safe
+			// for these chars but trim + unslash is more explicit for credential fields.
+			if ( in_array( $key, [ 'access_key', 'secret_key' ], true ) ) {
+				$sanitized[ $key ] = trim( wp_unslash( (string) $val ) );
+			} else {
+				$sanitized[ $key ] = sanitize_text_field( $val );
+			}
 		}
+
+		// Whitelist interval to prevent arbitrary cron hook names.
+		$allowed_intervals        = [ 'none', 'daily', 'weekly' ];
+		$sanitized['interval']    = in_array( $sanitized['interval'] ?? '', $allowed_intervals, true )
+			? $sanitized['interval']
+			: 'none';
 
 		// Handle Cron Schedule
 		$old_settings = get_option( 'lean_backup_s3_settings' );
-		$new_interval = $sanitized['interval'] ?? 'none';
+		$new_interval = $sanitized['interval'];
 		$old_interval = $old_settings['interval'] ?? 'none';
 
 		if ( $new_interval !== $old_interval ) {
@@ -221,3 +234,8 @@ class Core {
 
 // Kick it off
 Core::instance();
+
+// Clear scheduled cron job on deactivation to prevent orphaned events.
+register_deactivation_hook( __FILE__, function () {
+	wp_clear_scheduled_hook( 'lean_backup_async_run' );
+} );

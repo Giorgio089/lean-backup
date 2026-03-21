@@ -15,8 +15,8 @@ class Worker {
 
 	public function __construct() {
 		$this->settings = get_option( 'lean_backup_s3_settings', [] );
-		
-		// Override with constants if defined for better security
+
+		// Override with constants if defined for better security.
 		if ( defined( 'LEAN_BACKUP_S3_KEY' ) ) {
 			$this->settings['access_key'] = LEAN_BACKUP_S3_KEY;
 		}
@@ -24,9 +24,10 @@ class Worker {
 			$this->settings['secret_key'] = LEAN_BACKUP_S3_SECRET;
 		}
 
-		$upload_dir     = wp_upload_dir();
-		$this->temp_dir = $upload_dir['basedir'] . '/lean-backup-tmp';
-		
+		// Use the OS temp dir — NOT the uploads folder which is web-accessible.
+		// Each WP install gets its own subdirectory to avoid collisions.
+		$this->temp_dir = rtrim( sys_get_temp_dir(), '/' ) . '/lean-backup-' . substr( md5( ABSPATH ), 0, 8 );
+
 		if ( ! file_exists( $this->temp_dir ) ) {
 			wp_mkdir_p( $this->temp_dir );
 		}
@@ -38,38 +39,55 @@ class Worker {
 			return;
 		}
 
-		$db_file  = $this->dump_database();
-		$zip_file = $this->create_zip( $db_file );
+		$db_file  = null;
+		$zip_file = null;
 
-		if ( $zip_file ) {
-			if ( $this->upload_to_s3( $zip_file ) ) {
+		try {
+			$db_file  = $this->dump_database();
+			$zip_file = $this->create_zip( $db_file );
+
+			if ( $zip_file && $this->upload_to_s3( $zip_file ) ) {
 				$this->cleanup_old_backups();
 				update_option( 'lean_backup_last_success', time() );
 			}
-			@unlink( $db_file );
-			@unlink( $zip_file );
+		} finally {
+			// Always remove temp files — even on exception or partial failure.
+			if ( $db_file && file_exists( $db_file ) ) {
+				@unlink( $db_file );
+			}
+			if ( $zip_file && file_exists( $zip_file ) ) {
+				@unlink( $zip_file );
+			}
 		}
 	}
 
 	private function dump_database() {
 		global $wpdb;
-		$file_path = $this->temp_dir . '/db-' . date( 'Y-m-d-His' ) . '.sql';
+		$file_path = $this->temp_dir . '/db-' . gmdate( 'Y-m-d-His' ) . '.sql';
 		$handle    = fopen( $file_path, 'w' );
 
-		$tables = $wpdb->get_col( "SHOW TABLES" );
+		$tables = $wpdb->get_col( 'SHOW TABLES' );
 
 		foreach ( $tables as $table ) {
-			$create = $wpdb->get_row( "SHOW CREATE TABLE $table", ARRAY_A );
-			fwrite( $handle, "DROP TABLE IF EXISTS `$table`;\n" . $create['Create Table'] . ";\n\n" );
+			// Backtick-escape table name to handle reserved words.
+			$create = $wpdb->get_row( "SHOW CREATE TABLE `{$table}`", ARRAY_A );
+			fwrite( $handle, "DROP TABLE IF EXISTS `{$table}`;\n" . $create['Create Table'] . ";\n\n" );
 
-			$count = $wpdb->get_var( "SELECT COUNT(*) FROM $table" );
+			$count      = $wpdb->get_var( "SELECT COUNT(*) FROM `{$table}`" );
 			$batch_size = 500;
 
 			for ( $i = 0; $i < $count; $i += $batch_size ) {
-				$rows = $wpdb->get_results( "SELECT * FROM $table LIMIT $i, $batch_size", ARRAY_A );
+				$rows = $wpdb->get_results( "SELECT * FROM `{$table}` LIMIT {$i}, {$batch_size}", ARRAY_A );
 				foreach ( $rows as $row ) {
-					$values = array_map( [ $wpdb, '_escape' ], array_values( $row ) );
-					fwrite( $handle, "INSERT INTO `$table` VALUES ('" . implode( "','", $values ) . "');\n" );
+					// Handle NULL values correctly; wrap everything else in escaped single quotes.
+					$values = array_map( function( $val ) use ( $wpdb ) {
+						if ( $val === null ) {
+							return 'NULL';
+						}
+						return "'" . $wpdb->_escape( $val ) . "'";
+					}, array_values( $row ) );
+
+					fwrite( $handle, "INSERT INTO `{$table}` VALUES (" . implode( ',', $values ) . ");\n" );
 				}
 			}
 			fwrite( $handle, "\n\n" );
@@ -80,7 +98,7 @@ class Worker {
 	}
 
 	private function create_zip( $db_file ) {
-		$zip_path = $this->temp_dir . '/backup-' . date( 'Y-m-d-His' ) . '.zip';
+		$zip_path = $this->temp_dir . '/backup-' . gmdate( 'Y-m-d-His' ) . '.zip';
 		$zip      = new \ZipArchive();
 
 		if ( $zip->open( $zip_path, \ZipArchive::CREATE ) !== true ) {
@@ -116,16 +134,35 @@ class Worker {
 		$signer    = new S3_Signer( $this->settings );
 		$file_name = basename( $file_path );
 		$headers   = $signer->get_auth_headers( $file_name, 'PUT', $file_path );
-		
-		$endpoint = "https://{$this->settings['bucket']}.{$this->settings['endpoint']}/$file_name";
+		$endpoint  = "https://{$this->settings['bucket']}.{$this->settings['endpoint']}/$file_name";
 
-		$response = wp_remote_put( $endpoint, [
-			'headers' => $headers,
-			'body'    => fopen( $file_path, 'r' ),
-			'timeout' => 300,
-		]);
+		// Use cURL directly for true streaming — wp_remote_put() buffers the
+		// entire file body in memory which can exhaust PHP's memory limit.
+		$fp         = fopen( $file_path, 'r' );
+		$file_size  = filesize( $file_path );
 
-		return ! is_wp_error( $response ) && wp_remote_retrieve_response_code( $response ) === 200;
+		$curl_headers = [];
+		foreach ( $headers as $k => $v ) {
+			$curl_headers[] = "$k: $v";
+		}
+
+		$ch = curl_init( $endpoint );
+		curl_setopt_array( $ch, [
+			CURLOPT_PUT            => true,
+			CURLOPT_INFILE         => $fp,
+			CURLOPT_INFILESIZE     => $file_size,
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_TIMEOUT        => 600,
+			CURLOPT_HTTPHEADER     => $curl_headers,
+			CURLOPT_SSL_VERIFYPEER => true,
+		] );
+
+		curl_exec( $ch );
+		$http_code = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+		curl_close( $ch );
+		fclose( $fp );
+
+		return $http_code === 200;
 	}
 
 	/**
