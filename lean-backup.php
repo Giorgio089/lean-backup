@@ -159,6 +159,18 @@ class Core {
 		$value   = isset( $options[ $id ] ) ? $options[ $id ] : '';
 		$type    = $args['type'];
 
+		// Check if credentials are overridden by wp-config.php constants
+		$is_disabled = false;
+		if ( 'access_key' === $id && defined( 'LEAN_BACKUP_S3_KEY' ) ) {
+			$value       = '******** (Defined in wp-config.php)';
+			$is_disabled = true;
+			$type        = 'text';
+		} elseif ( 'secret_key' === $id && defined( 'LEAN_BACKUP_S3_SECRET' ) ) {
+			$value       = '******** (Defined in wp-config.php)';
+			$is_disabled = true;
+			$type        = 'text';
+		}
+
 		if ( 'select' === $type ) {
 			echo '<select name="lean_backup_s3_settings[' . esc_attr( $id ) . ']" id="' . esc_attr( $id ) . '">';
 			echo '<option value="none" ' . selected( $value, 'none', false ) . '>' . __( 'Disabled (Manual only)', 'lean-backup' ) . '</option>';
@@ -167,11 +179,12 @@ class Core {
 			echo '</select>';
 		} else {
 			echo sprintf(
-				'<input type="%s" name="lean_backup_s3_settings[%s]" id="%s" value="%s" class="regular-text">',
+				'<input type="%s" name="%s" id="%s" value="%s" class="regular-text" %s>',
 				esc_attr( $type ),
+				$is_disabled ? '' : 'lean_backup_s3_settings[' . esc_attr( $id ) . ']',
 				esc_attr( $id ),
-				esc_attr( $id ),
-				esc_attr( $value )
+				esc_attr( $value ),
+				$is_disabled ? 'disabled' : ''
 			);
 		}
 	}

@@ -39,26 +39,102 @@ class Worker {
 			return;
 		}
 
-		$db_file  = null;
-		$zip_file = null;
+		$db_file = null;
 
 		try {
-			$db_file  = $this->dump_database();
-			$zip_file = $this->create_zip( $db_file );
+			$db_file = $this->dump_database();
+			
+			// Try OS-level zero-disk streaming first
+			if ( $this->can_stream() ) {
+				$success = $this->stream_to_s3( $db_file );
+			} else {
+				// Fallback to local ZipArchive (requires disk space)
+				$zip_file = $this->create_zip( $db_file );
+				$success  = ( $zip_file && $this->upload_to_s3( $zip_file ) );
+				if ( $zip_file && file_exists( $zip_file ) ) {
+					@unlink( $zip_file );
+				}
+			}
 
-			if ( $zip_file && $this->upload_to_s3( $zip_file ) ) {
+			if ( $success ) {
 				$this->cleanup_old_backups();
 				update_option( 'lean_backup_last_success', time() );
 			}
 		} finally {
-			// Always remove temp files — even on exception or partial failure.
 			if ( $db_file && file_exists( $db_file ) ) {
 				@unlink( $db_file );
 			}
-			if ( $zip_file && file_exists( $zip_file ) ) {
-				@unlink( $zip_file );
-			}
 		}
+	}
+
+	/**
+	 * Check if OS-level tools (tar, curl) and proc_open are available
+	 * for zero-disk streaming.
+	 */
+	private function can_stream() {
+		if ( ! function_exists( 'proc_open' ) || ! function_exists( 'exec' ) ) {
+			return false;
+		}
+		$disabled = explode( ',', ini_get( 'disable_functions' ) );
+		if ( in_array( 'proc_open', array_map( 'trim', $disabled ) ) ) {
+			return false;
+		}
+		
+		// Quick check for required binaries
+		$tar  = @exec( 'command -v tar' );
+		$curl = @exec( 'command -v curl' );
+		return ! empty( $tar ) && ! empty( $curl );
+	}
+
+	/**
+	 * High-performance streaming: tar -> pipe -> curl -> S3
+	 * No local archive file is ever created.
+	 */
+	private function stream_to_s3( $db_file ) {
+		$signer    = new S3_Signer( $this->settings );
+		$file_name = 'backup-' . gmdate( 'Y-m-d-His' ) . '.tar.gz';
+		// Note: We use UNSIGNED-PAYLOAD for streaming, which S3 allows for chunked/piped uploads via HTTPS.
+		$headers   = $signer->get_auth_headers( $file_name, 'PUT' );
+		$endpoint  = "https://{$this->settings['bucket']}.{$this->settings['endpoint']}/$file_name";
+
+		$curl_headers = '';
+		foreach ( $headers as $k => $v ) {
+			// Escape header strings for shell
+			$curl_headers .= " -H " . escapeshellarg( "$k: $v" );
+		}
+
+		$wp_content = escapeshellarg( WP_CONTENT_DIR );
+		$db_arg     = escapeshellarg( $db_file );
+		
+		// Build the pipeline:
+		// 1. tar cvz: create gzip archive. -C changes to content dir. We include wp-content contents and the DB dump.
+		// 2. curl -T - : upload stdin to S3 endpoint
+		$cmd = "tar -czf - -C " . dirname( $wp_content ) . " " . basename( $wp_content ) . " -C " . dirname( $db_arg ) . " " . basename( $db_arg ) . " 2>/dev/null | curl -s -S -X PUT -T - " . $curl_headers . " " . escapeshellarg( $endpoint );
+
+		$descriptorspec = [
+			0 => [ 'pipe', 'r' ], // stdin
+			1 => [ 'pipe', 'w' ], // stdout (curl output)
+			2 => [ 'pipe', 'w' ]  // stderr
+		];
+
+		$process = proc_open( $cmd, $descriptorspec, $pipes );
+
+		if ( is_resource( $process ) ) {
+			fclose( $pipes[0] );
+			$output = stream_get_contents( $pipes[1] );
+			$error  = stream_get_contents( $pipes[2] );
+			fclose( $pipes[1] );
+			fclose( $pipes[2] );
+			
+			$return_value = proc_close( $process );
+			
+			// If curl returns 0, the stream succeeded.
+			if ( $return_value === 0 && empty( $error ) ) {
+				return true;
+			}
+			error_log( "Lean Backup Stream Error: $error | Output: $output" );
+		}
+		return false;
 	}
 
 	private function dump_database() {
